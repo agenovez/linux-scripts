@@ -11,6 +11,10 @@ set -euo pipefail
 #   - Persistencia solo de consultas bloqueadas:
 #       /var/log/pihole/blocked-only.log
 #   - Rotación 90 días solo para blocked-only.log
+# Para ejecutar forzando IPv6 apagado manualmente:
+#    UNBOUND_IPV6=no sudo -E bash pihole-unbound-blocked-only-clean.sh
+# Para modo automático, que es el recomendado:
+#    UNBOUND_IPV6=auto sudo -E bash pihole-unbound-blocked-only-clean.sh
 # ==========================================================
 
 # --------------------------
@@ -155,17 +159,40 @@ fi
 # --------------------------
 # Configuración Unbound
 # --------------------------
-info "Configurando Unbound en 127.0.0.1:${UNBOUND_PORT}..."
+info "Configurando Unbound exclusivamente en 127.0.0.1:${UNBOUND_PORT}..."
+
+# Respaldar toda la configuración de Unbound, no solo un archivo
+backup_if_exists "/etc/unbound"
+
+mkdir -p "$UNBOUND_CONF_DIR"
+mkdir -p "$UNBOUND_DISABLED_DIR"
+
+# Evitar configuraciones residuales que puedan forzar ::1:53 o 0.0.0.0:53
+# Se conserva root-auto-trust-anchor-file.conf si existe.
+if compgen -G "${UNBOUND_CONF_DIR}/*.conf" > /dev/null; then
+    find "$UNBOUND_CONF_DIR" -maxdepth 1 -type f -name "*.conf" \
+        ! -name "root-auto-trust-anchor-file.conf" \
+        -exec mv {} "$UNBOUND_DISABLED_DIR"/ \;
+    ok "Configuraciones previas de Unbound movidas a: $UNBOUND_DISABLED_DIR"
+fi
+
+# Archivo principal limpio: solo incluye conf.d
+cat > "$UNBOUND_MAIN_CONF" <<EOF
+include-toplevel: "${UNBOUND_CONF_DIR}/*.conf"
+EOF
 
 cat > "$UNBOUND_CONF" <<EOF
 server:
     verbosity: 0
 
+    # IMPORTANTE:
+    # Unbound NO debe escuchar en puerto 53.
+    # Pi-hole usa :53 y Unbound queda como resolver interno en 127.0.0.1:${UNBOUND_PORT}.
     interface: 127.0.0.1
     port: ${UNBOUND_PORT}
 
     do-ip4: yes
-    do-ip6: ${UNBOUND_IPV6}
+    do-ip6: ${UNBOUND_IPV6_EFFECTIVE}
     prefer-ip6: no
 
     do-udp: yes
@@ -180,6 +207,7 @@ server:
 
     harden-glue: yes
     harden-dnssec-stripped: yes
+    harden-referral-path: yes
 
     use-caps-for-id: no
     edns-buffer-size: 1232
@@ -187,6 +215,7 @@ server:
     prefetch: yes
     prefetch-key: yes
     qname-minimisation: yes
+    aggressive-nsec: yes
 
     rrset-cache-size: 256m
     msg-cache-size: 128m
@@ -206,6 +235,8 @@ server:
     private-address: fe80::/10
 EOF
 
+ok "Archivo Unbound generado: $UNBOUND_CONF"
+
 info "Ajustando buffers del kernel para Unbound..."
 cat > /etc/sysctl.d/99-pihole-unbound.conf <<EOF
 net.core.rmem_max=1048576
@@ -217,6 +248,21 @@ sysctl --system >/dev/null || warn "No se pudo aplicar sysctl completamente. Rev
 info "Validando configuración de Unbound..."
 unbound-checkconf
 
+#MEJORAS
+info "Validando que el puerto ${UNBOUND_PORT} no esté ocupado por otro proceso..."
+
+if ss -lntup 2>/dev/null | grep -q ":${UNBOUND_PORT} "; then
+    warn "El puerto TCP ${UNBOUND_PORT} ya aparece en uso:"
+    ss -lntup | grep ":${UNBOUND_PORT} " || true
+fi
+
+if ss -lnup 2>/dev/null | grep -q ":${UNBOUND_PORT} "; then
+    warn "El puerto UDP ${UNBOUND_PORT} ya aparece en uso:"
+    ss -lnup | grep ":${UNBOUND_PORT} " || true
+fi
+
+systemctl reset-failed unbound || true
+systemctl daemon-reload
 systemctl enable unbound
 systemctl restart unbound
 
