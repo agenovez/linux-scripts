@@ -37,7 +37,10 @@ FTL_DROPIN_FILE="/etc/systemd/system/pihole-FTL.service.d/10-run-log-path.conf"
 BLOCKED_SERVICE="/etc/systemd/system/pihole-blocked-only-log.service"
 LOGROTATE_CONF="/etc/logrotate.d/pihole-blocked-only"
 
-UNBOUND_CONF="/etc/unbound/unbound.conf.d/pi-hole.conf"
+UNBOUND_MAIN_CONF="/etc/unbound/unbound.conf"
+UNBOUND_CONF_DIR="/etc/unbound/unbound.conf.d"
+UNBOUND_CONF="/etc/unbound/unbound.conf.d/99-pihole-recursive.conf"
+UNBOUND_DISABLED_DIR="/etc/unbound/disabled-conf-$(date +%F-%H%M%S)"
 ROOT_HINTS="/var/lib/unbound/root.hints"
 
 BACKUP_DIR="/root/pihole-clean-backup-$(date +%F-%H%M%S)"
@@ -50,7 +53,8 @@ INSTALL_PIHOLE_IF_MISSING="${INSTALL_PIHOLE_IF_MISSING:-0}"
 # IPv6 en Unbound:
 # Para su caso dejamos IPv6 desactivado por defecto porque así quedó estable.
 # Cambie a "yes" solo si el servidor tiene IPv6 funcional.
-UNBOUND_IPV6="${UNBOUND_IPV6:-no}"
+UNBOUND_IPV6="${UNBOUND_IPV6:-auto}"
+UNBOUND_IPV6_EFFECTIVE="no"
 
 
 # --------------------------
@@ -88,6 +92,51 @@ backup_if_exists() {
     fi
 }
 
+detect_ipv6_for_unbound() {
+    local forced="${UNBOUND_IPV6}"
+
+    case "$forced" in
+        yes)
+            echo "yes"
+            return 0
+            ;;
+        no)
+            echo "no"
+            return 0
+            ;;
+        auto)
+            ;;
+        *)
+            die "Valor inválido para UNBOUND_IPV6='${forced}'. Use: auto, yes o no."
+            ;;
+    esac
+
+    if [[ ! -f /proc/net/if_inet6 ]]; then
+        warn "IPv6 no está disponible en el kernel. Unbound usará do-ip6: no."
+        echo "no"
+        return 0
+    fi
+
+    if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)" == "1" ]]; then
+        warn "IPv6 está deshabilitado por sysctl. Unbound usará do-ip6: no."
+        echo "no"
+        return 0
+    fi
+
+    if ! ip -6 addr show scope global up 2>/dev/null | grep -q "inet6"; then
+        warn "No se detectó IPv6 global activa. Unbound usará do-ip6: no."
+        echo "no"
+        return 0
+    fi
+
+    if ! ip -6 route show default 2>/dev/null | grep -q "^default"; then
+        warn "No se detectó ruta default IPv6. Unbound usará do-ip6: no."
+        echo "no"
+        return 0
+    fi
+
+    echo "yes"
+}
 
 # --------------------------
 # Inicio
