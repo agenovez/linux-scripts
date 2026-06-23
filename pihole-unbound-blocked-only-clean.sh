@@ -14,7 +14,9 @@ set -euo pipefail
 # Para ejecutar forzando IPv6 apagado manualmente:
 #    UNBOUND_IPV6=no sudo -E bash pihole-unbound-blocked-only-clean.sh
 # Para modo automático, que es el recomendado:
-#    UNBOUND_IPV6=auto sudo -E bash pihole-unbound-blocked-only-clean.sh
+#    UNBOUND_IPV6=auto sudo -E bash pihole-unbound-blocked-only-clean.sh 
+# En el caso de necesitar ambas variables hacerlo asi:
+# sudo env UNBOUND_IPV6=no INSTALL_PIHOLE_IF_MISSING=1 bash pihole-unbound-blocked-only-clean.sh
 # ==========================================================
 
 # --------------------------
