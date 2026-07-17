@@ -444,12 +444,17 @@ start_and_verify() {
     info "Service state: $(systemctl is-active "${SERVICE_NAME}.service")"
     info "Boot state: $(systemctl is-enabled "${SERVICE_NAME}.service")"
 
-    local owner
-    owner="$(ps -o user= -C OoklaServer 2>/dev/null | awk 'NF {print $1; exit}')"
+    local main_pid owner=""
+    main_pid="$(systemctl show --property=MainPID --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        owner="$(ps -o user= -p "$main_pid" 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+    fi
+
     if [[ "$owner" == "$SERVICE_USER" ]]; then
-        info "Process ownership verified: ${owner}"
+        info "Process ownership verified: ${owner} (PID ${main_pid})"
     else
-        warn "Could not conclusively verify process ownership; inspect systemctl status manually"
+        warn "Could not conclusively verify process ownership (MainPID=${main_pid:-unknown}, owner=${owner:-unknown}); inspect systemctl status manually"
     fi
 
     info "Listening sockets associated with OoklaServer:"
