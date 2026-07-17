@@ -341,6 +341,79 @@ run_vendor_install() {
     chmod 0640 "${AUDIT_ROOT}/OoklaServer-${TIMESTAMP}.sha256"
 }
 
+
+configure_ookla_properties() {
+    local properties_file="${INSTALL_DIR}/OoklaServer.properties"
+    local backup_file="${AUDIT_ROOT}/OoklaServer.properties-${TIMESTAMP}.before"
+    local tmp_file
+
+    info "Configuring OoklaServer properties: ${properties_file}"
+
+    if [[ -f "$properties_file" ]]; then
+        install -o root -g root -m 0640 "$properties_file" "$backup_file"
+        info "Previous properties preserved for audit: ${backup_file}"
+    else
+        install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0640 /dev/null "$properties_file"
+        info "Created properties file: ${properties_file}"
+    fi
+
+    set_ookla_property() {
+        local key="$1"
+        local value="$2"
+
+        tmp_file="$(mktemp "${INSTALL_DIR}/.OoklaServer.properties.XXXXXX")"
+
+        awk -v key="$key" -v replacement="${key} = ${value}" '
+            BEGIN { written = 0 }
+            {
+                candidate = $0
+                sub(/^[[:space:]]*/, "", candidate)
+                split(candidate, fields, "=")
+                found_key = fields[1]
+                sub(/[[:space:]]*$/, "", found_key)
+
+                if (found_key == key) {
+                    if (!written) {
+                        print replacement
+                        written = 1
+                    }
+                    next
+                }
+
+                print
+            }
+            END {
+                if (!written) {
+                    print replacement
+                }
+            }
+        ' "$properties_file" > "$tmp_file"
+
+        chown "$SERVICE_USER:$SERVICE_GROUP" "$tmp_file"
+        chmod 0640 "$tmp_file"
+        mv -f -- "$tmp_file" "$properties_file"
+    }
+
+    set_ookla_property \
+        "OoklaServer.allowedDomains" \
+        "*.ookla.com, *.speedtest.net"
+
+    set_ookla_property \
+        "OoklaServer.ssl.useLetsEncrypt" \
+        "true"
+
+    chown "$SERVICE_USER:$SERVICE_GROUP" "$properties_file"
+    chmod 0640 "$properties_file"
+
+    grep -Fqx 'OoklaServer.allowedDomains = *.ookla.com, *.speedtest.net' "$properties_file" \
+        || die "Failed to configure OoklaServer.allowedDomains"
+
+    grep -Fqx 'OoklaServer.ssl.useLetsEncrypt = true' "$properties_file" \
+        || die "Failed to enable OoklaServer.ssl.useLetsEncrypt"
+
+    info "OoklaServer allowed domains and Let's Encrypt support configured"
+}
+
 write_systemd_unit() {
     local unit_file="/etc/systemd/system/${SERVICE_NAME}.service"
     local protect_home="true"
@@ -518,6 +591,7 @@ main() {
 
     download_installer
     run_vendor_install "$INSTALLER_PATH"
+    configure_ookla_properties
     write_systemd_unit
     configure_ufw
     start_and_verify
