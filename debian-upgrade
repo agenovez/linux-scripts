@@ -1,0 +1,26 @@
+echo "=== OPERATING SYSTEM ==="
+cat /etc/os-release
+cat /etc/debian_version
+uname -a
+
+echo "=== CRITICAL PACKAGE VERSIONS ==="
+dpkg-query -W -f='${Package} ${Version} ${Status}\n' \
+  base-files apt systemd libc6 openssh-server 2>/dev/null
+
+echo "=== PACKAGE DATABASE ==="
+sudo dpkg --audit
+
+echo "=== HELD PACKAGES ==="
+apt-mark showhold
+
+echo "=== APT REPOSITORIES ==="
+grep -RnsE '^[[:space:]]*(deb[[:space:]]|URIs:|Suites:)' \
+  /etc/apt/sources.list \
+  /etc/apt/sources.list.d/ 2>/dev/null
+
+echo "=== PACKAGE CANDIDATES ==="
+apt-cache policy base-files systemd openssh-server
+
+echo "=== SSH SERVICE FILES ==="
+ls -l /lib/systemd/system/ssh.service \
+  /usr/lib/systemd/system/ssh.service 2>&1
