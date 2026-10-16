@@ -1,26 +1,286 @@
-echo "=== OPERATING SYSTEM ==="
-cat /etc/os-release
-cat /etc/debian_version
-uname -a
+#!/usr/bin/env bash
+# Controlled Debian Bullseye -> Bookworm -> Trixie upgrade.
+# Purposefully interactive: never skips release boundaries, package reviews or reboots.
+set -Eeuo pipefail
+umask 077
 
-echo "=== CRITICAL PACKAGE VERSIONS ==="
-dpkg-query -W -f='${Package} ${Version} ${Status}\n' \
-  base-files apt systemd libc6 openssh-server 2>/dev/null
+STATE=/var/lib/debian-staged-upgrade
+BACKUPS=/var/backups/debian-staged-upgrade
+LOGDIR=/var/log/debian-staged-upgrade
+mkdir -p "$STATE" "$BACKUPS" "$LOGDIR"
+LOG="$LOGDIR/$(date +%Y%m%d-%H%M%S)-${1:-help}.log"
+exec > >(tee -a "$LOG") 2>&1
+trap 'rc=$?; echo "ERROR: exited with code $rc. Review log: '"$LOG"'" >&2' ERR
 
-echo "=== PACKAGE DATABASE ==="
-sudo dpkg --audit
+say() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
+fail() { printf '\nSTOP: %s\n' "$*" >&2; exit 1; }
+version() { ( . /etc/os-release; printf '%s' "${VERSION_ID:-unknown}" ); }
+package_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true; }
+require_root() { [[ $EUID -eq 0 ]] || fail "Use sudo: sudo bash $0 $1"; }
+confirm() {
+    local phrase="$1" input
+    printf '\nType exactly %s to continue: ' "$phrase"
+    IFS= read -r input || fail 'No interactive approval received.'
+    [[ "$input" == "$phrase" ]] || fail 'Approval cancelled. No further changes made.'
+}
+require_terminal() { [[ -t 0 ]] || fail 'Interactive console required (not cron or a piped shell).'; }
 
-echo "=== HELD PACKAGES ==="
-apt-mark showhold
+inventory() {
+    say 'OS / kernel / packages'
+    cat /etc/os-release
+    uname -r
+    dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' \
+      base-files apt libc6 systemd openssh-server debian-archive-keyring 2>/dev/null || true
+    say 'Package database issues'
+    dpkg --audit || true
+    say 'Held packages'
+    apt-mark showhold || true
+    say 'Disk space'
+    df -h / /var /boot 2>/dev/null || true
+    say 'Active APT sources'
+    grep -RnsE '^[[:space:]]*(deb[[:space:]]|URIs:|Suites:)' \
+      /etc/apt/sources.list /etc/apt/sources.list.d/ --include='*.list' --include='*.sources' \
+      2>/dev/null || true
+    say 'Services'
+    systemctl is-active ssh apache2 mariadb mysql postgresql 2>/dev/null || true
+    say 'Remaining stage indicators'
+    ls -la "$STATE" || true
+    echo "Log: $LOG"
+}
 
-echo "=== APT REPOSITORIES ==="
-grep -RnsE '^[[:space:]]*(deb[[:space:]]|URIs:|Suites:)' \
-  /etc/apt/sources.list \
-  /etc/apt/sources.list.d/ 2>/dev/null
+preflight() {
+    require_terminal
+    say 'Safety gate'
+    echo 'A VERIFIED, EXTERNAL VM snapshot/backup and a database backup are required.'
+    echo 'Use a hypervisor/physical console, not an unprotected SSH session.'
+    echo 'Stop if this server is business-critical and you cannot accept downtime.'
+    if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
+        fail 'Detected SSH without tmux/screen; use an out-of-band console or protected session.'
+    fi
+    if [[ -n "$(dpkg --audit)" ]]; then
+        dpkg --audit
+        fail 'Package database not clean. Diagnose before trying again; do not force dpkg.'
+    fi
+    if [[ -n "$(apt-mark showhold)" ]]; then
+        apt-mark showhold
+        fail 'Held packages need manual review before distribution upgrade.'
+    fi
+    if [[ -s /etc/apt/preferences ]] || find /etc/apt/preferences.d -maxdepth 1 -type f -size +0c 2>/dev/null | grep -q .; then
+        fail 'APT pinning detected. Inspect /etc/apt/preferences* manually.'
+    fi
+    df -h / /var /boot || true
+    confirm 'BACKUP-AND-CONSOLE-VERIFIED'
+}
 
-echo "=== PACKAGE CANDIDATES ==="
-apt-cache policy base-files systemd openssh-server
+snapshot_config() {
+    local target="$1" dest stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest="$BACKUPS/before-${target}-${stamp}"
+    mkdir -p "$dest/disabled-sources"
+    cp -a /etc/apt "$dest/apt"
+    cp -a /etc/ssh "$dest/ssh" 2>/dev/null || true
+    cp -a /etc/os-release "$dest/os-release"
+    dpkg --get-selections '*' > "$dest/dpkg-selections.txt"
+    dpkg-query -W > "$dest/installed-packages.txt"
+    cp -a /etc/fstab "$dest/fstab" 2>/dev/null || true
+    ip -br address > "$dest/ip-addresses.txt" 2>/dev/null || true
+    ip route show table all > "$dest/ip-routes.txt" 2>/dev/null || true
+    cp -a /etc/network "$dest/network-config" 2>/dev/null || true
+    cp -a /etc/systemd/network "$dest/systemd-network" 2>/dev/null || true
+    printf '%s\n' "$dest" > "$STATE/backup-${target}"
+    echo "APT/SSH/package configuration backup: $dest"
+    echo 'This is NOT a VM snapshot and does NOT back up the GestioIP database.'
+}
 
-echo "=== SSH SERVICE FILES ==="
-ls -l /lib/systemd/system/ssh.service \
-  /usr/lib/systemd/system/ssh.service 2>&1
+set_debian_sources() {
+    local codename="$1" target="$2" backup file
+    backup="$(cat "$STATE/backup-${target}")"
+    say "Disabling old and third-party APT sources; writing Debian $target ($codename) sources"
+    if [[ -e /etc/apt/sources.list || -L /etc/apt/sources.list ]]; then
+        mv /etc/apt/sources.list "$backup/disabled-sources/sources.list"
+    fi
+    while IFS= read -r -d '' file; do
+        mv "$file" "$backup/disabled-sources/$(basename "$file")"
+    done < <(find /etc/apt/sources.list.d -maxdepth 1 \( -type f -o -type l \) \
+      \( -name '*.list' -o -name '*.sources' \) -print0)
+    # Deliberately do not enable old vendor mirrors. .bak files are not active.
+    cat > /etc/apt/sources.list.d/debian.sources <<EOF
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: ${codename} ${codename}-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: https://security.debian.org/debian-security
+Suites: ${codename}-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    echo "Backed up disabled source definitions to $backup/disabled-sources"
+}
+
+update_lists() {
+    say 'Updating package lists (any repository failure is fatal)'
+    apt-get -o APT::Update::Error-Mode=any update
+}
+
+review_plan() {
+    local target="$1" plan="$STATE/upgrade-${1}-simulation.txt"
+    say "Simulating complete Debian $target upgrade"
+    apt-get -s full-upgrade | tee "$plan"
+    say 'Packages marked for removal in the simulation'
+    if grep '^Remv ' "$plan"; then
+        echo 'Review every removal carefully, especially GestioIP, Apache, Perl, and database packages.'
+        # Some obsolete/transitional packages may legitimately be removed.
+        if grep -Eq '^Remv (apache2|mariadb-server|mysql-server|postgresql|openssh-server|sudo|gestioip)([[:space:]]|$)' "$plan"; then
+            fail "A critical service/package is proposed for removal. Review $plan manually."
+        fi
+        confirm "REMOVALS-REVIEWED-${target}"
+    else
+        echo '(none)'
+    fi
+    echo "Saved simulation to: $plan"
+    confirm "APPROVE-DEBIAN-${target}"
+}
+
+quiesce_database() {
+    local target="$1" svc
+    # Debian 13 release notes require a CLEAN MariaDB shutdown before
+    # an upgrade across MariaDB major versions.
+    for svc in mariadb mysql; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            say "Stopping $svc cleanly before package upgrade"
+            systemctl stop "$svc"
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                fail "$svc is still running: aborting."
+            fi
+            journalctl -u "$svc" -n 20 --no-pager 2>/dev/null || true
+            echo 'Check MariaDB/MySQL error logs for a completed clean shutdown.'
+            confirm "DB-SHUTDOWN-VERIFIED-${target}"
+        fi
+    done
+}
+
+ensure_ssh() {
+    say 'Restoring OpenSSH Server'
+    # Reinstalls server unit if package was in "config-files" state, as here.
+    apt-get install openssh-server
+    if [[ -f /usr/sbin/sshd ]]; then /usr/sbin/sshd -t; fi
+    systemctl unmask ssh.service || true
+    systemctl daemon-reload
+    systemctl enable --now ssh.service
+    systemctl is-active --quiet ssh.service || fail 'SSH is not active; DO NOT REBOOT.'
+    ss -ltnp | grep -E ':(22|2222)[[:space:]]' || true
+    echo 'SSH is active; separately verify remote login and firewall rules.'
+}
+
+verify_core() {
+    local target="$1" bf sd
+    say "Checking core components for Debian $target"
+    dpkg --audit
+    [[ -z "$(dpkg --audit)" ]] || fail 'dpkg audit is not clean.'
+    bf="$(package_version base-files)"
+    sd="$(package_version systemd)"
+    echo "base-files: $bf"
+    echo "systemd:    $sd"
+    echo "OS version: $(version)"
+    [[ "$(version)" == "$target" && "$bf" == "${target}."* ]] || \
+      fail "Base OS not fully upgraded to $target; do not proceed to the next release."
+    if [[ "$target" == 12 ]]; then
+        [[ "$sd" == 252.* ]] || fail 'Expected Debian 12 systemd 252.x, verify manually.'
+    else
+        [[ "$sd" == 257.* ]] || fail 'Expected Debian 13 systemd 257.x, verify manually.'
+    fi
+    dpkg-query -W -f='${Status}\n' openssh-server | grep -qx 'install ok installed' || \
+      fail 'OpenSSH Server is not completely installed.'
+    systemctl is-active --quiet ssh.service || fail 'SSH service not active.'
+    echo 'Core package checks passed. Application/network integrity is NOT automatically verified.'
+}
+
+run_stage() {
+    local target="$1" preceding expected phase boot
+    [[ "$target" == 12 || "$target" == 13 ]] || fail 'Unknown target.'
+    preceding=$((target-1))
+    expected="$(version)"
+    phase="$(cat "$STATE/in-progress" 2>/dev/null || true)"
+
+    if [[ -f "$STATE/completed-${target}" ]]; then
+        fail "Stage $target already marked complete. Use check; do not rerun this stage."
+    fi
+    if [[ "$target" == 13 ]]; then
+        [[ -f "$STATE/completed-12" ]] || fail 'Debian 12 stage has not been completed and verified.'
+        boot="$(cat "$STATE/boot-id-after-12" 2>/dev/null || true)"
+        [[ -n "$boot" && "$(cat /proc/sys/kernel/random/boot_id)" != "$boot" ]] || \
+          fail 'Reboot is required after stage 12, before starting stage 13.'
+        [[ "$expected" == 12 ]] || fail 'Debian 13 stage requires a Debian 12 OS.'
+        verify_core 12
+        local sshv
+        sshv="$(package_version openssh-server)"
+        dpkg --compare-versions "$sshv" ge "1:9.2p1-2+deb12u7" || \
+          fail "Bookworm OpenSSH $sshv is too old for safe remote upgrade. Update Debian 12 first."
+    else
+        if [[ "$phase" != 12 && "$expected" != 11 ]]; then
+            fail "Stage 12 needs Debian 11 or an existing interrupted stage 12. Current: $expected"
+        fi
+    fi
+    if [[ -n "$phase" && "$phase" != "$target" ]]; then
+        fail "Another stage ($phase) is still in progress; do not mix releases."
+    fi
+    preflight
+    say "Starting controlled Debian $preceding -> $target"
+    if [[ -z "$phase" ]]; then
+        snapshot_config "$target"
+        printf '%s\n' "$target" > "$STATE/in-progress"
+        set_debian_sources "$( [[ "$target" == 12 ]] && echo bookworm || echo trixie )" "$target"
+    else
+        echo "Resuming stage $target. Existing source configuration will be reused."
+    fi
+    update_lists
+    quiesce_database "$target"
+    say 'Minimal upgrade (interactive; no automatic -y)'
+    apt-get upgrade --without-new-pkgs
+    review_plan "$target"
+    quiesce_database "$target"
+    say 'Full distribution upgrade (interactive; inspect all dpkg prompts)'
+    apt-get full-upgrade
+    say 'Ensuring Debian kernel metapackage is installed'
+    # Required if someone manually installed a versioned kernel in the past.
+    apt-get install linux-image-amd64
+    ensure_ssh
+    verify_core "$target"
+    date -Is > "$STATE/completed-${target}"
+    cat /proc/sys/kernel/random/boot_id > "$STATE/boot-id-after-${target}"
+    rm -f "$STATE/in-progress"
+    say "Debian $target packages upgraded. IMPORTANT: REBOOT REQUIRED."
+    echo 'Before reboot: verify GestioIP, database, network, application config and remote SSH access.'
+    if [[ "$target" == 12 ]]; then
+        echo 'After the reboot: sudo bash debian_11_to_13_staged_upgrade.sh to13'
+    else
+        echo 'After the reboot: sudo bash debian_11_to_13_staged_upgrade.sh check'
+    fi
+    echo "Full log: $LOG"
+}
+
+require_root "${1:-check}"
+case "${1:-check}" in
+    check) inventory ;;
+    to12) run_stage 12 ;;
+    to13) run_stage 13 ;;
+    *) cat <<'HELP'
+Usage:
+  sudo bash debian_11_to_13_staged_upgrade.sh check    # Read-only diagnosis
+  sudo bash debian_11_to_13_staged_upgrade.sh to12     # Controlled 11 -> 12
+  # Verify application, SSH and reboot manually. Then:
+  sudo bash debian_11_to_13_staged_upgrade.sh to13     # Controlled 12 -> 13
+  # Verify application, SSH and reboot manually. Then:
+  sudo bash debian_11_to_13_staged_upgrade.sh check
+
+Requires console access and VERIFIED external VM + database backups.
+Runs apt-get interactively. Aborts on dpkg errors, held packages, APT errors,
+failed simulated dependency resolution, critical removals, or failed SSH service.
+Logs: /var/log/debian-staged-upgrade/
+APT configuration copies: /var/backups/debian-staged-upgrade/
+HELP
+       ;;
+esac
