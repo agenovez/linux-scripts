@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Definición de variables
+DOMAIN="su_dominio"
+CERT_DIR="/etc/wazuh-dashboard/certs"
+
+# 1. Renovación de certificado Let's Encrypt e inyección en el Dashboard
+# El deploy-hook asegura que los certificados se copien y apliquen solo si la renovación es exitosa.
+certbot renew --quiet --deploy-hook "cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem $CERT_DIR/wazuh-dashboard.pem && cp /etc/letsencrypt/live/$DOMAIN/privkey.pem $CERT_DIR/wazuh-dashboard-key.pem && chown wazuh-dashboard:wazuh-dashboard $CERT_DIR/*.pem && systemctl restart wazuh-dashboard"
+
+# 2. Actualización de componentes centrales de Wazuh
+# Para sistemas basados en Red Hat/CentOS, sustituya 'apt-get' por 'yum upgrade'.
+apt-get update
+apt-get install --only-upgrade wazuh-indexer wazuh-manager wazuh-dashboard -y
+
+# 3. Reinicio de servicios para aplicar parches y forzar la sincronización del feed de inteligencia
+systemctl daemon-reload
+systemctl restart wazuh-indexer
+systemctl restart wazuh-manager
+systemctl restart wazuh-dashboard
